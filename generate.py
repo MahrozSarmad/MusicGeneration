@@ -1,4 +1,7 @@
+import time
 from pathlib import Path
+from datetime import datetime
+
 import pretty_midi
 from tqdm import tqdm
 import torch
@@ -69,7 +72,12 @@ def load_all_notes(midi_files):
     all_events = []
 
     for midi_file in tqdm(midi_files, desc="Loading MIDI files"):
-        all_events.extend(extract_notes(midi_file))
+        try:
+            all_events.extend(extract_notes(midi_file))
+        except Exception as e:
+            # Some MIDI files in large datasets are malformed - skip rather
+            # than crash a multi-hour run over one bad file
+            print(f"Skipping {midi_file} due to error: {e}")
 
     return all_events
 
@@ -81,11 +89,29 @@ def load_all_notes(midi_files):
 # Bin edges are computed from quantiles of the actual data, so bins adapt to
 # whatever range of durations/velocities/gaps appear in your dataset instead
 # of guessing fixed cutoffs.
+#
+# BUGFIX: with a large pooled dataset (1000+ files), it only takes ONE file
+# with an unusually long pause (or a slightly malformed file with a stray
+# late note) to make the raw maximum value huge - e.g. a 40-second gap.
+# np.quantile's top edge is always the raw max, so the *center* of the last
+# bin (the value used when DECODING back to seconds during generation) would
+# then be something like (normal_high_value + 40s) / 2 ~= 20 seconds.
+# If the model samples that bin even once during a 200-note generation, it
+# inserts a ~20-second silent gap into the output - which is exactly the
+# "20 seconds of music, rest is silence" symptom.
+#
+# Fix: clip extreme outliers out of the data before computing quantile edges,
+# so every bin center stays in a realistic range no matter what one weird
+# file in a 1000+ file dataset contains.
 
 class FeatureQuantizer:
 
-    def __init__(self, values, num_bins=32):
+    def __init__(self, values, num_bins=32, clip_percentile=99.5):
         values = np.asarray(values, dtype=np.float64)
+
+        if clip_percentile is not None and len(values) > 0:
+            cap = np.percentile(values, clip_percentile)
+            values = np.clip(values, values.min(), cap)
 
         quantiles = np.linspace(0, 1, num_bins + 1)
         edges = np.quantile(values, quantiles)
@@ -105,7 +131,9 @@ class FeatureQuantizer:
 
     def encode(self, value):
         # np.digitize gives 1..num_bins for values inside range; clip to
-        # valid bin index range
+        # valid bin index range. Values above the (clipped) top edge simply
+        # fall into the last bin, same as before - the difference is that
+        # the last bin's center is now sane instead of outlier-driven.
         idx = np.digitize([value], self.edges[1:-1], right=False)[0]
         return int(np.clip(idx, 0, self.num_bins - 1))
 
@@ -126,9 +154,12 @@ def build_vocabularies(events, num_duration_bins=32, num_velocity_bins=32, num_t
     velocities = [e[2] for e in events]
     time_shifts = [e[3] for e in events]
 
-    duration_q = FeatureQuantizer(durations, num_duration_bins)
-    velocity_q = FeatureQuantizer(velocities, num_velocity_bins)
-    timeshift_q = FeatureQuantizer(time_shifts, num_timeshift_bins)
+    # Velocity is already bounded to 0-127 by the MIDI spec, so outliers
+    # aren't a concern there. Duration and time_shift are unbounded seconds
+    # values pooled across many files, so they get outlier clipping.
+    duration_q = FeatureQuantizer(durations, num_duration_bins, clip_percentile=99.5)
+    velocity_q = FeatureQuantizer(velocities, num_velocity_bins, clip_percentile=None)
+    timeshift_q = FeatureQuantizer(time_shifts, num_timeshift_bins, clip_percentile=99.5)
 
     vocab = {
         "pitch_size": 128,  # fixed MIDI pitch range, no quantizer needed
@@ -166,45 +197,42 @@ def encode_events(events, vocab):
 # ---------------------------------------------------------------------------
 # Sequences / Dataset
 # ---------------------------------------------------------------------------
-
-def create_sequences(encoded_events, sequence_length=50):
-    """
-    Build input/target pairs. Each input is a window of `sequence_length`
-    encoded event-tuples; each target is the single next event-tuple.
-    """
-
-    inputs = []
-    targets = []
-
-    for i in range(len(encoded_events) - sequence_length):
-
-        input_seq = encoded_events[i:i + sequence_length]
-        target = encoded_events[i + sequence_length]
-
-        inputs.append(input_seq)
-        targets.append(target)
-
-    return inputs, targets
-
+#
+# IMPORTANT - memory-safe design:
+# The old approach built every single (sequence_length) window into a Python
+# list up front, then converted the whole thing into one big NumPy array.
+# That's fine for 20 files, but with the full dataset (potentially millions
+# of notes) it would try to allocate an array of many terabytes and crash.
+#
+# Instead, MusicDataset now stores the full encoded event stream ONCE as a
+# compact NumPy array, and slices out each window on-the-fly in __getitem__.
+# Memory usage stays roughly constant no matter how large the dataset is.
 
 class MusicDataset(Dataset):
     """
-    inputs:  list of sequences, each a list of (pitch, duration, velocity, time_shift) idx tuples
-    targets: list of (pitch, duration, velocity, time_shift) idx tuples
+    encoded_events: list of (pitch_idx, duration_idx, velocity_idx, timeshift_idx)
+                    tuples, IN ORDER, covering the whole dataset.
+    sequence_length: length of each input window.
     """
 
-    def __init__(self, inputs, targets):
-        inputs = np.array(inputs, dtype=np.int64)   # (N, seq_len, 4)
-        targets = np.array(targets, dtype=np.int64)  # (N, 4)
-
-        self.inputs = torch.from_numpy(inputs)
-        self.targets = torch.from_numpy(targets)
+    def __init__(self, encoded_events, sequence_length=50):
+        # Single compact array for the whole dataset - this is the only
+        # large allocation, and it's proportional to (num_notes, 4), not
+        # (num_windows, sequence_length, 4).
+        self.data = np.array(encoded_events, dtype=np.int64)  # (N, 4)
+        self.sequence_length = sequence_length
 
     def __len__(self):
-        return len(self.inputs)
+        return max(0, len(self.data) - self.sequence_length)
 
     def __getitem__(self, index):
-        return self.inputs[index], self.targets[index]
+        window = self.data[index: index + self.sequence_length]         # (seq_len, 4)
+        target = self.data[index + self.sequence_length]                # (4,)
+
+        x = torch.from_numpy(window.copy())
+        y = torch.from_numpy(target.copy())
+
+        return x, y
 
 
 # ---------------------------------------------------------------------------
@@ -291,51 +319,161 @@ def train_model(
     loader,
     device,
     num_epochs=20,
-    learning_rate=1e-3
+    learning_rate=1e-3,
+    grad_clip_norm=5.0
 ):
     """
     Trains on all 4 features jointly. Total loss is the sum of the
     cross-entropy losses for pitch, duration, velocity, and time_shift.
+
+    Uses automatic mixed precision (AMP) when training on a CUDA GPU, and
+    gradient clipping to keep LSTM training stable on larger datasets.
+    Per-feature losses are logged separately so you can see which feature
+    (pitch/duration/velocity/timeshift) is learning well vs struggling.
     """
 
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
+    use_amp = (device.type == "cuda")
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
     model.train()
 
     for epoch in range(num_epochs):
 
-        total_loss = 0.0
+        totals = {"loss": 0.0, "pitch": 0.0, "duration": 0.0, "velocity": 0.0, "timeshift": 0.0}
 
         progress = tqdm(loader, desc=f"Epoch {epoch + 1}/{num_epochs}")
 
         for x, y in progress:
 
-            x = x.to(device)
-            y = y.to(device)
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
 
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
-            pitch_logits, duration_logits, velocity_logits, timeshift_logits, _ = model(x)
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                pitch_logits, duration_logits, velocity_logits, timeshift_logits, _ = model(x)
 
-            pitch_loss = criterion(pitch_logits, y[:, 0])
-            duration_loss = criterion(duration_logits, y[:, 1])
-            velocity_loss = criterion(velocity_logits, y[:, 2])
-            timeshift_loss = criterion(timeshift_logits, y[:, 3])
+                pitch_loss = criterion(pitch_logits, y[:, 0])
+                duration_loss = criterion(duration_logits, y[:, 1])
+                velocity_loss = criterion(velocity_logits, y[:, 2])
+                timeshift_loss = criterion(timeshift_logits, y[:, 3])
 
-            loss = pitch_loss + duration_loss + velocity_loss + timeshift_loss
+                loss = pitch_loss + duration_loss + velocity_loss + timeshift_loss
 
-            loss.backward()
-            optimizer.step()
+            scaler.scale(loss).backward()
 
-            total_loss += loss.item()
+            # Gradient clipping - unscale first so the clip threshold is
+            # applied to the real gradient magnitudes, not the scaled ones
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
 
-            progress.set_postfix(loss=loss.item())
+            scaler.step(optimizer)
+            scaler.update()
 
-        avg_loss = total_loss / len(loader)
-        print(f"Epoch {epoch + 1}/{num_epochs} - avg loss: {avg_loss:.4f}")
+            totals["loss"] += loss.item()
+            totals["pitch"] += pitch_loss.item()
+            totals["duration"] += duration_loss.item()
+            totals["velocity"] += velocity_loss.item()
+            totals["timeshift"] += timeshift_loss.item()
+
+            progress.set_postfix(
+                loss=loss.item(),
+                pitch=pitch_loss.item(),
+                dur=duration_loss.item(),
+                vel=velocity_loss.item(),
+                shift=timeshift_loss.item()
+            )
+
+        n = len(loader)
+        print(
+            f"Epoch {epoch + 1}/{num_epochs} - "
+            f"avg loss: {totals['loss'] / n:.4f} "
+            f"(pitch {totals['pitch'] / n:.4f}, "
+            f"duration {totals['duration'] / n:.4f}, "
+            f"velocity {totals['velocity'] / n:.4f}, "
+            f"timeshift {totals['timeshift'] / n:.4f})"
+        )
 
     return model
+
+
+def benchmark_epoch_time(model, dataset, device, batch_size=64, num_batches=20):
+    """
+    Times a small number of training batches to estimate how long one full
+    epoch (and the whole training run) will take, WITHOUT committing to the
+    full run. Useful before scaling up from 20 files to the full dataset.
+    """
+
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        pin_memory=(device.type == "cuda"),
+        num_workers=4
+    )
+
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    use_amp = (device.type == "cuda")
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
+    model.train()
+
+    it = iter(loader)
+    batches_timed = 0
+
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    start = time.time()
+
+    for _ in range(num_batches):
+        try:
+            x, y = next(it)
+        except StopIteration:
+            break
+
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            pitch_logits, duration_logits, velocity_logits, timeshift_logits, _ = model(x)
+            loss = (
+                criterion(pitch_logits, y[:, 0])
+                + criterion(duration_logits, y[:, 1])
+                + criterion(velocity_logits, y[:, 2])
+                + criterion(timeshift_logits, y[:, 3])
+            )
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+        batches_timed += 1
+
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    elapsed = time.time() - start
+
+    if batches_timed == 0:
+        print("Not enough data to benchmark.")
+        return None
+
+    seconds_per_batch = elapsed / batches_timed
+    batches_per_epoch = len(loader)
+    seconds_per_epoch = seconds_per_batch * batches_per_epoch
+
+    print(
+        f"\nBenchmark: {seconds_per_batch:.3f}s/batch on this dataset "
+        f"({batches_per_epoch} batches/epoch)"
+    )
+    print(f"Estimated time per epoch: {seconds_per_epoch / 60:.1f} minutes")
+
+    return seconds_per_epoch
 
 
 # ---------------------------------------------------------------------------
@@ -356,12 +494,12 @@ def generate_events(
     timeshift_idx) tuples, then decode them back into real
     (pitch, duration, velocity, time_shift) values.
 
-    seed_sequence: list of encoded idx-tuples, length == sequence_length
+    seed_sequence: list/array of encoded idx-tuples, length == sequence_length
     """
 
     model.eval()
 
-    generated_idx = list(seed_sequence)
+    generated_idx = [tuple(int(v) for v in row) for row in seed_sequence]
 
     with torch.no_grad():
         for _ in range(num_notes):
@@ -499,92 +637,191 @@ def midi_to_mp3(
 if __name__ == "__main__":
 
     data_path = "data/maestro-v1.0.0-midi/maestro-v1.0.0"
+    checkpoint_path = "music_lstm.pt"
 
-    files = find_midi_files(data_path)
-    sample_files = files[:50]
-    all_events = load_all_notes(sample_files)
+    # Set this to True to force retraining even if a checkpoint already exists
+    force_retrain = False
 
-    print(f"Total notes: {len(all_events):,}")
+    # Set this to True to use every MIDI file found under data_path instead
+    # of just the first 20 (only relevant when actually training).
+    use_full_dataset = True
 
-    vocab = build_vocabularies(
-        all_events,
-        num_duration_bins=32,
-        num_velocity_bins=32,
-        num_timeshift_bins=32
-    )
-
-    print(f"Pitch vocab size: {vocab['pitch_size']}")
-    print(f"Duration bins: {vocab['duration_size']}")
-    print(f"Velocity bins: {vocab['velocity_size']}")
-    print(f"Time-shift bins: {vocab['timeshift_size']}")
-
-    encoded_events = encode_events(all_events, vocab)
+    # If True, times a handful of batches before committing to a full
+    # training run and prints an estimated time per epoch / full run.
+    run_benchmark_first = True
 
     sequence_length = 50
-
-    inputs, targets = create_sequences(
-        encoded_events,
-        sequence_length
-    )
-
-    print(f"Total training samples: {len(inputs):,}")
-
-    dataset = MusicDataset(inputs, targets)
-
     batch_size = 64
-
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=True
-    )
-
-    for x, y in loader:
-        print("Input batch:", x.shape)   # (batch, seq_len, 4)
-        print("Target batch:", y.shape)  # (batch, 4)
-        break
-
-    model = MusicLSTM(
-        pitch_size=vocab["pitch_size"],
-        duration_size=vocab["duration_size"],
-        velocity_size=vocab["velocity_size"],
-        timeshift_size=vocab["timeshift_size"]
-    )
-
-    print(model)
-
-    device = torch.device(
-        "cuda" if torch.cuda.is_available()
-        else "cpu"
-    )
-
-    model = model.to(device)
-    print(device)
-
-    # ---- Train ----
     num_epochs = 20
 
-    model = train_model(
-        model,
-        loader,
-        device,
-        num_epochs=num_epochs,
-        learning_rate=1e-3
-    )
+    # How many files to scan when a checkpoint already exists and we only
+    # need a short seed sequence to kick off generation - no need to rescan
+    # the whole 1000+ file dataset just to generate.
+    num_seed_files = 5
 
-    torch.save(
-        {
-            "model_state_dict": model.state_dict(),
-            "vocab": vocab,
-            "sequence_length": sequence_length,
-        },
-        "music_lstm.pt"
-    )
-    print("Saved model checkpoint to music_lstm.pt")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    if device.type == "cuda":
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+    else:
+        print("No GPU detected - training will run on CPU (slower). "
+              "If you have an NVIDIA GPU, make sure a CUDA-enabled build of "
+              "PyTorch is installed.")
 
-    # ---- Generate ----
-    seed_sequence = inputs[0]
+    checkpoint_exists = Path(checkpoint_path).exists() and not force_retrain
 
+    # -----------------------------------------------------------------
+    # Checkpoint already exists: load weights + vocab and SKIP the full
+    # file scan / encode / train pipeline entirely. We only need a small
+    # seed sequence to start generation, so we scan a handful of files
+    # instead of all 1000+.
+    # -----------------------------------------------------------------
+    if checkpoint_exists:
+        print(f"Found checkpoint at {checkpoint_path} - loading weights, "
+              f"skipping the full MIDI scan/training pipeline.")
+
+        # weights_only=False is required here (PyTorch >= 2.6 defaults to
+        # True) because our checkpoint's "vocab" dict contains custom
+        # FeatureQuantizer objects, not just tensors. This is safe as long
+        # as the checkpoint file is one you saved yourself / trust.
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+
+        # IMPORTANT: reuse the exact vocab/sequence_length the model was
+        # trained with, not freshly rebuilt ones - bin edges must match
+        # what the model's embeddings/output heads were trained on.
+        vocab = checkpoint["vocab"]
+        sequence_length = checkpoint["sequence_length"]
+
+        model = MusicLSTM(
+            pitch_size=vocab["pitch_size"],
+            duration_size=vocab["duration_size"],
+            velocity_size=vocab["velocity_size"],
+            timeshift_size=vocab["timeshift_size"]
+        ).to(device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        print("Model weights loaded successfully. Skipping training.")
+
+        seed_files = find_midi_files(data_path)[:num_seed_files]
+        print(f"Scanning {len(seed_files)} file(s) for a generation seed "
+              f"(not the full dataset).")
+
+        seed_events = load_all_notes(seed_files)
+        seed_encoded = encode_events(seed_events, vocab)
+
+        if len(seed_encoded) < sequence_length:
+            raise RuntimeError(
+                f"Only found {len(seed_encoded)} notes across {num_seed_files} "
+                f"seed file(s), but need at least {sequence_length} for a "
+                f"seed sequence. Increase num_seed_files."
+            )
+
+        seed_sequence = np.array(seed_encoded[:sequence_length], dtype=np.int64)
+
+    # -----------------------------------------------------------------
+    # No checkpoint (or force_retrain=True): run the full pipeline.
+    # -----------------------------------------------------------------
+    else:
+        print("No checkpoint found (or force_retrain=True) - "
+              "running the full pipeline: scan all files, build vocab, train.")
+
+        files = find_midi_files(data_path)
+
+        if not use_full_dataset:
+            files = files[:20]
+
+        print(f"Found {len(files):,} MIDI files - using {len(files):,} of them")
+
+        all_events = load_all_notes(files)
+
+        print(f"Total notes: {len(all_events):,}")
+
+        vocab = build_vocabularies(
+            all_events,
+            num_duration_bins=32,
+            num_velocity_bins=32,
+            num_timeshift_bins=32
+        )
+
+        print(f"Pitch vocab size: {vocab['pitch_size']}")
+        print(f"Duration bins: {vocab['duration_size']}")
+        print(f"Velocity bins: {vocab['velocity_size']}")
+        print(f"Time-shift bins: {vocab['timeshift_size']}")
+
+        encoded_events = encode_events(all_events, vocab)
+
+        # NOTE: sequences are no longer pre-built into a giant list/array.
+        # MusicDataset slices windows on-the-fly from the single encoded
+        # stream, so this stays memory-safe even for millions of notes.
+        dataset = MusicDataset(encoded_events, sequence_length)
+
+        print(f"Total training samples: {len(dataset):,}")
+
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            pin_memory=(device.type == "cuda"),
+            num_workers=4
+        )
+
+        for x, y in loader:
+            print("Input batch:", x.shape)   # (batch, seq_len, 4)
+            print("Target batch:", y.shape)  # (batch, 4)
+            break
+
+        model = MusicLSTM(
+            pitch_size=vocab["pitch_size"],
+            duration_size=vocab["duration_size"],
+            velocity_size=vocab["velocity_size"],
+            timeshift_size=vocab["timeshift_size"]
+        ).to(device)
+
+        print(model)
+
+        if run_benchmark_first:
+            print("\nRunning a quick benchmark before committing to full training...")
+            est_seconds_per_epoch = benchmark_epoch_time(model, dataset, device, batch_size=batch_size)
+
+            if est_seconds_per_epoch is not None:
+                num_epochs_planned = num_epochs
+                est_total_minutes = (est_seconds_per_epoch * num_epochs_planned) / 60
+                print(
+                    f"Estimated total training time for {num_epochs_planned} epochs: "
+                    f"~{est_total_minutes:.1f} minutes (~{est_total_minutes / 60:.1f} hours)\n"
+                )
+
+            # Re-create the model fresh so the benchmark's optimizer steps
+            # don't affect the real training run
+            model = MusicLSTM(
+                pitch_size=vocab["pitch_size"],
+                duration_size=vocab["duration_size"],
+                velocity_size=vocab["velocity_size"],
+                timeshift_size=vocab["timeshift_size"]
+            ).to(device)
+
+        model = train_model(
+            model,
+            loader,
+            device,
+            num_epochs=num_epochs,
+            learning_rate=1e-3
+        )
+
+        torch.save(
+            {
+                "model_state_dict": model.state_dict(),
+                "vocab": vocab,
+                "sequence_length": sequence_length,
+            },
+            checkpoint_path
+        )
+        print(f"Saved model checkpoint to {checkpoint_path}")
+
+        seed_sequence = dataset[0][0].numpy()  # first window, shape (seq_len, 4)
+
+    # -----------------------------------------------------------------
+    # Generate (common path, whether we just trained or just loaded)
+    # -----------------------------------------------------------------
     generated_events = generate_events(
         model,
         seed_sequence,
@@ -598,8 +835,19 @@ if __name__ == "__main__":
     print(f"\nGenerated {len(generated_events)} events")
     print(generated_events[:10])
 
+    # ---- Timestamped output files, so each run keeps its own take instead
+    #      of overwriting the previous generated_music.mid/.mp3 ----
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    midi_path = f"generated_music_{timestamp}.mid"
+    mp3_path = f"generated_music_{timestamp}.mp3"
+
     events_to_midi(
         generated_events,
-        output_path="generated_music.mid"
+        output_path=midi_path
     )
 
+    # ---- Export to MP3 ----
+    midi_to_mp3(
+        midi_path=midi_path,
+        mp3_path=mp3_path
+    )
