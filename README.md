@@ -28,7 +28,7 @@ music-rnn/
 │           ├── 2011/
 │           └── ...
 └── generate.py
-
+└── music_lstm.pt
 ```
 
 ---
