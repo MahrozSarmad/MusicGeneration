@@ -92,7 +92,3 @@ python generate.py --output output.mid --length 500 --temperature 1.0
 
 ---
 
-
-## License
-
-Distributed under the MIT License. See `LICENSE` for details.
